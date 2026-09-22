@@ -637,9 +637,12 @@ def main(argv=None) -> int:
         markers = {op: op for op in ops}
 
     npus = resolve_npus(args.gpus)
-    out_root = Path(args.output_dir) if args.output_dir else (
+    # Resolve to an absolute path: TRITON_CACHE_DIR / --output / log paths are
+    # handed verbatim to subprocesses that run with cwd=<repo>/benchmark, so a
+    # relative --output-dir would otherwise land under benchmark/ instead.
+    out_root = (Path(args.output_dir) if args.output_dir else (
         ROOT / "results" / f"ab-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    )
+    )).resolve()
     ensure_dir(out_root)
 
     try:
