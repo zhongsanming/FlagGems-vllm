@@ -95,6 +95,19 @@ def median(values) -> float | None:
     return (vals[n // 2 - 1] + vals[n // 2]) / 2
 
 
+def percentile(values, q: float) -> float | None:
+    """Linear-interpolated percentile (q in [0, 1])."""
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return None
+    if len(vals) == 1:
+        return vals[0]
+    pos = q * (len(vals) - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, len(vals) - 1)
+    return vals[lo] + (vals[hi] - vals[lo]) * (pos - lo)
+
+
 def fmt(value, digits: int = 3) -> str:
     if value is None:
         return "-"
@@ -436,6 +449,8 @@ def diff_performance(perf_on: dict, perf_off: dict, threshold: float):
             "geomean_ratio": geomean(ratios),
             "mean_ratio": mean(ratios),
             "median_ratio": median(ratios),
+            "p25_ratio": percentile(ratios, 0.25),
+            "p75_ratio": percentile(ratios, 0.75),
             "min_ratio": min(ratios) if ratios else None,
             "max_ratio": max(ratios) if ratios else None,
             "mean_speedup_on": mean(speedups_on),
@@ -446,6 +461,7 @@ def diff_performance(perf_on: dict, perf_off: dict, threshold: float):
                     "n": len(rs),
                     "geomean_ratio": geomean(rs),
                     "mean_ratio": mean(rs),
+                    "median_ratio": median(rs),
                 }
                 for dt, rs in sorted(dtype_ratios.items())
             },
@@ -578,9 +594,11 @@ def write_perf_csvs(out: Path, perf_rows, perf_ops):
             "n_invalid",
             "n_only_on",
             "n_only_off",
+            "median_latency_ratio",
+            "p25_latency_ratio",
+            "p75_latency_ratio",
             "geomean_latency_ratio",
             "mean_latency_ratio",
-            "median_latency_ratio",
             "min_latency_ratio",
             "max_latency_ratio",
             "mean_speedup_off",
@@ -597,9 +615,11 @@ def write_perf_csvs(out: Path, perf_rows, perf_ops):
                 s["n_invalid"],
                 s["n_only_on"],
                 s["n_only_off"],
+                csv_num(s["median_ratio"]),
+                csv_num(s["p25_ratio"]),
+                csv_num(s["p75_ratio"]),
                 csv_num(s["geomean_ratio"]),
                 csv_num(s["mean_ratio"]),
-                csv_num(s["median_ratio"]),
                 csv_num(s["min_ratio"]),
                 csv_num(s["max_ratio"]),
                 csv_num(s["mean_speedup_off"]),
@@ -741,7 +761,9 @@ def write_markdown(out: Path, payload, top_n: int) -> None:
         f"- Regressed (<= -{meta['threshold'] * 100:.1f}%): **{ps['n_regressed']}**"
     )
     lines.append(f"- Neutral: {ps['n_neutral']}")
-    lines.append(f"- Overall geomean latency ratio: **{fmt(ps['geomean_ratio'])}**")
+    lines.append(f"- Overall median latency ratio: **{fmt(ps['median_ratio'])}** "
+                 f"(p25 {fmt(ps['p25_ratio'])}, p75 {fmt(ps['p75_ratio'])})")
+    lines.append(f"- Overall geomean latency ratio: {fmt(ps['geomean_ratio'])}")
     lines.append(f"- Overall mean latency ratio: {fmt(ps['mean_ratio'])}")
     lines.append(f"- Only ON / only OFF cases: {ps['n_only_on']} / {ps['n_only_off']}")
     lines.append("")
@@ -749,13 +771,13 @@ def write_markdown(out: Path, payload, top_n: int) -> None:
     ranked = list(perf["ops"].items())
 
     def top_improved(n):
-        xs = [x for x in ranked if x[1]["geomean_ratio"] is not None and x[1]["geomean_ratio"] > 1]
-        xs.sort(key=lambda kv: kv[1]["geomean_ratio"], reverse=True)
+        xs = [x for x in ranked if x[1]["median_ratio"] is not None and x[1]["median_ratio"] > 1]
+        xs.sort(key=lambda kv: kv[1]["median_ratio"], reverse=True)
         return xs[:n]
 
     def top_regressed(n):
-        xs = [x for x in ranked if x[1]["geomean_ratio"] is not None and x[1]["geomean_ratio"] < 1]
-        xs.sort(key=lambda kv: kv[1]["geomean_ratio"])
+        xs = [x for x in ranked if x[1]["median_ratio"] is not None and x[1]["median_ratio"] < 1]
+        xs.sort(key=lambda kv: kv[1]["median_ratio"])
         return xs[:n]
 
     for title, xs in (
@@ -767,12 +789,14 @@ def write_markdown(out: Path, payload, top_n: int) -> None:
         lines.append(f"### {title}")
         lines.append("")
         lines.append(
-            "| Op | Matched | Geomean ratio | Mean speedup OFF->ON | Improved | Regressed |"
+            "| Op | Matched | Median ratio (p25-p75) | Geomean | Mean speedup OFF->ON | Improved | Regressed |"
         )
-        lines.append("| --- | --- | --- | --- | --- | --- |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
         for op, s in xs:
             lines.append(
-                f"| `{op}` | {s['n_matched']} | **{fmt(s['geomean_ratio'])}** | "
+                f"| `{op}` | {s['n_matched']} | "
+                f"**{fmt(s['median_ratio'])}** ({fmt(s['p25_ratio'])}-{fmt(s['p75_ratio'])}) | "
+                f"{fmt(s['geomean_ratio'])} | "
                 f"{fmt(s['mean_speedup_off'])} -> {fmt(s['mean_speedup_on'])} | "
                 f"{s['n_improved']} | {s['n_regressed']} |"
             )
@@ -906,10 +930,10 @@ def _ratio_class(ratio) -> str:
 def _bar_chart(title: str, ops, top_n: int) -> str:
     if not ops:
         return ""
-    max_abs = max(abs(s["geomean_ratio"] - 1) for _, s in ops) or 1.0
+    max_abs = max(abs(s["median_ratio"] - 1) for _, s in ops) or 1.0
     rows = []
     for op, s in ops:
-        delta = s["geomean_ratio"] - 1
+        delta = s["median_ratio"] - 1
         width = min(100.0, abs(delta) / max_abs * 100.0)
         cls = "good" if delta >= 0 else "bad"
         rows.append(
@@ -918,7 +942,7 @@ def _bar_chart(title: str, ops, top_n: int) -> str:
             "<div class='bar-track'>"
             f"<div class='bar-fill {cls}' style='width:{width:.1f}%'></div>"
             "</div>"
-            f"<span class='bar-label'>{s['geomean_ratio']:.3f}x</span>"
+            f"<span class='bar-label'>{s['median_ratio']:.3f}x</span>"
             "</div>"
         )
     return (
@@ -951,6 +975,7 @@ def write_html(out: Path, payload, top_n: int) -> None:
     parts.append("<div class='cards'>")
     for label, value, cls in (
         ("Matched perf cases", ps["n_matched"], ""),
+        ("Median latency ratio", fmt(ps["median_ratio"]), _ratio_class(ps["median_ratio"])),
         ("Geomean latency ratio", fmt(ps["geomean_ratio"]), _ratio_class(ps["geomean_ratio"])),
         ("Improved", ps["n_improved"], "good"),
         ("Regressed", ps["n_regressed"], "bad"),
@@ -972,17 +997,17 @@ def write_html(out: Path, payload, top_n: int) -> None:
     # charts
     ranked = list(perf["ops"].items())
     improved = sorted(
-        [x for x in ranked if x[1]["geomean_ratio"] and x[1]["geomean_ratio"] > 1],
-        key=lambda kv: kv[1]["geomean_ratio"],
+        [x for x in ranked if x[1]["median_ratio"] and x[1]["median_ratio"] > 1],
+        key=lambda kv: kv[1]["median_ratio"],
         reverse=True,
     )[:top_n]
     regressed = sorted(
-        [x for x in ranked if x[1]["geomean_ratio"] and x[1]["geomean_ratio"] < 1],
-        key=lambda kv: kv[1]["geomean_ratio"],
+        [x for x in ranked if x[1]["median_ratio"] and x[1]["median_ratio"] < 1],
+        key=lambda kv: kv[1]["median_ratio"],
     )[:top_n]
     parts.append("<h2>Top operator movements</h2>")
-    parts.append(_bar_chart(f"Top {top_n} improved (geomean latency ratio)", improved, top_n))
-    parts.append(_bar_chart(f"Top {top_n} regressed (geomean latency ratio)", regressed, top_n))
+    parts.append(_bar_chart(f"Top {top_n} improved (median latency ratio)", improved, top_n))
+    parts.append(_bar_chart(f"Top {top_n} regressed (median latency ratio)", regressed, top_n))
 
     # per-op perf table
     parts.append("<h2>Performance by operator</h2>")
@@ -995,14 +1020,17 @@ def write_html(out: Path, payload, top_n: int) -> None:
     perf_header = [
         ("Op", 0, False),
         ("Matched", 1, True),
-        ("Geomean ratio", 2, True),
-        ("Mean ratio", 3, True),
-        ("Speedup OFF", 4, True),
-        ("Speedup ON", 5, True),
-        ("Delta", 6, True),
-        ("Improved", 7, True),
-        ("Regressed", 8, True),
-        ("Neutral", 9, True),
+        ("Median ratio", 2, True),
+        ("p25", 3, True),
+        ("p75", 4, True),
+        ("Geomean", 5, True),
+        ("Mean", 6, True),
+        ("Speedup OFF", 7, True),
+        ("Speedup ON", 8, True),
+        ("Delta", 9, True),
+        ("Improved", 10, True),
+        ("Regressed", 11, True),
+        ("Neutral", 12, True),
     ]
     for label, idx, num in perf_header:
         parts.append(
@@ -1013,15 +1041,21 @@ def write_html(out: Path, payload, top_n: int) -> None:
     for op, s in sorted(
         perf["ops"].items(),
         key=lambda kv: (
-            kv[1]["geomean_ratio"] if kv[1]["geomean_ratio"] is not None else 9e9
+            kv[1]["median_ratio"] if kv[1]["median_ratio"] is not None else 9e9
         ),
     ):
         parts.append("<tr>")
         parts.append(f"<td><code>{html.escape(op)}</code></td>")
         parts.append(f"<td data-v='{s['n_matched']}'>{s['n_matched']}</td>")
         parts.append(
+            f"<td data-v='{s['median_ratio'] or 0}' class='{_ratio_class(s['median_ratio'])}'>"
+            f"<b>{_num(s['median_ratio'])}</b></td>"
+        )
+        parts.append(f"<td data-v='{s['p25_ratio'] or 0}'>{_num(s['p25_ratio'])}</td>")
+        parts.append(f"<td data-v='{s['p75_ratio'] or 0}'>{_num(s['p75_ratio'])}</td>")
+        parts.append(
             f"<td data-v='{s['geomean_ratio'] or 0}' class='{_ratio_class(s['geomean_ratio'])}'>"
-            f"<b>{_num(s['geomean_ratio'])}</b></td>"
+            f"{_num(s['geomean_ratio'])}</td>"
         )
         parts.append(f"<td data-v='{s['mean_ratio'] or 0}'>{_num(s['mean_ratio'])}</td>")
         parts.append(f"<td data-v='{s['mean_speedup_off'] or 0}'>{_num(s['mean_speedup_off'])}</td>")
@@ -1157,6 +1191,8 @@ def main(argv=None) -> int:
         "geomean_ratio": geomean(matched_ratios),
         "mean_ratio": mean(matched_ratios),
         "median_ratio": median(matched_ratios),
+        "p25_ratio": percentile(matched_ratios, 0.25),
+        "p75_ratio": percentile(matched_ratios, 0.75),
     }
     # per-dtype global summary
     dtype_ratios: dict[str, list] = defaultdict(list)
@@ -1220,6 +1256,8 @@ def main(argv=None) -> int:
         f"regressed={perf_summary['n_regressed']}  "
         f"neutral={perf_summary['n_neutral']}"
     )
+    print(f"  median ratio={fmt(perf_summary['median_ratio'])} "
+          f"(p25 {fmt(perf_summary['p25_ratio'])}, p75 {fmt(perf_summary['p75_ratio'])})")
     print(f"  geomean ratio={fmt(perf_summary['geomean_ratio'])}")
     print("=" * 68)
     print(f"Outputs written to: {out}/")

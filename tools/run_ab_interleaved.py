@@ -11,11 +11,13 @@ NPUs.
           TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE=1
 
 Every compilation is forced fresh (TRITON_ALWAYS_COMPILE=1) and dumped into a
-per-config, per-run cache (TRITON_CACHE_DIR); nothing is pruned. TTIR is
-<out>/<config>/cache/<hash>/<kernel>.ttir (plus the other stages). Dumps are
-printed in MLIR generic op form by default via TRITON_MLIR_PRINT_OP_GENERIC=1
-(equivalent to --mlir-print-op-generic); pass --no-generic-ir to keep the
-custom printer.
+per-config, per-NPU cache (TRITON_CACHE_DIR). By default only the TTIR/TTADAPTER
+dumps plus the ``.json`` metadata and ``.source`` are kept; the other stages
+(.mlirbc/.bcmlir/.npubin/...) are pruned as each op finishes to save disk
+(--keep-all-stages disables this).
+TTIR is <out>/<config>/cache/npu<N>/<hash>/<kernel>.ttir. Dumps are printed in
+MLIR generic op form by default via TRITON_MLIR_PRINT_OP_GENERIC=1 (equivalent
+to --mlir-print-op-generic); pass --no-generic-ir to keep the custom printer.
 
 Benchmarks use ``--metrics latency`` only, so the torch/native baseline is
 never timed (no latency_base / speedup / tflops / gbps). Accuracy keeps
@@ -24,21 +26,42 @@ test harness).
 
 Retries
 -------
-Every test case whose result is not ``passed`` (or ``skipped``, which is
-deterministic and not retried unless --retry-skipped is given) is a failure.
-The first run records which cases failed; each failing case is then retried
-individually until it has run at most --max-runs times total (default 5,
-including the first run) on the same NPU/config. A benchmark run that crashes
-or reports a failed operator is retried whole, also capped at --max-runs total.
-Every failed attempt is appended to <out>/retries.<npu>.jsonl, even when a
-later attempt succeeds, and a <out>/retry_summary.json is written at the end.
+Whole-op retries happen only on infrastructure failure (a missing or invalid
+result JSON), up to --max-runs total. Case-level accuracy failures are recorded
+as-is by default; pass --retry-cases to retry them individually (also capped at
+--max-runs). Benchmark case-level errors are never retried whole. Retrying
+pre-existing failures is off by default: it wasted hours for almost no recovery
+and the extra load perturbed concurrent benchmarks. Every failed attempt is
+appended to <out>/retries.<npu>.jsonl, and <out>/retry_summary.json is written
+at the end.
+
+Stages
+------
+--stage {both,accuracy,benchmark} (default both) runs only the selected stage and
+keeps the other stage's existing results, so benchmarks can be redone without
+re-running accuracy (and vice versa).
 
 At the end ``tools/compare_results.py`` is invoked unless --no-compare.
 
+Resuming (default)
+------------------
+Re-running with the same ``--output-dir`` resumes: ops that already have
+complete results for every config are skipped and only the unfinished ones are
+queued. An op is finished when every config has a valid ``accuracy_result.json``
+and ``performance_result.json`` (a truncated file from a disk-full kill does not
+parse and counts as unfinished). Use ``--force`` to rerun everything, and
+``--min-free-gb`` to abort early when the disk is nearly full.
+
 Examples
 --------
-    # whole suite, all NPUs
+    # whole suite, all NPUs (a fresh --output-dir runs everything)
     python tools/run_ab_interleaved.py --gpus all
+
+    # resume an interrupted run (reuse the same --output-dir)
+    python tools/run_ab_interleaved.py --output-dir results/ab-lv-blockmode
+
+    # rerun everything in that dir
+    python tools/run_ab_interleaved.py --output-dir results/ab-lv-blockmode --force
 
     # a subset, single NPU
     python tools/run_ab_interleaved.py --ops "add,sum_dim,flip" --gpus 0
@@ -55,6 +78,7 @@ import json
 import multiprocessing as mp
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -129,6 +153,60 @@ def read_json(path: Path):
             return json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError, ValueError):
         return None
+
+
+_RESULT_FILES = {
+    "accuracy": "accuracy_result.json",
+    "benchmark": "performance_result.json",
+}
+
+
+def op_finished(out_root: Path, configs: list[str], op: str,
+                stages=("accuracy", "benchmark")) -> bool:
+    """Whether an op already has complete results for the requested stages.
+
+    A stage is complete when every config has a valid result file. A truncated
+    file (e.g. from a disk-full kill) does not parse and counts as unfinished.
+    """
+    for config in configs:
+        for stage in stages:
+            path = out_root / config / "results" / op / _RESULT_FILES[stage]
+            if not path.is_file() or read_json(path) is None:
+                return False
+    return True
+
+
+def prune_cache_stages(cache_dir: Path, only_dirs: set | None = None) -> int:
+    """Delete dumped stage files that are not kept.
+
+    Kept by default: ``.ttir``, ``.ttadapter`` stage dumps, plus the ``.json``
+    metadata and ``.source`` files. ``only_dirs`` restricts pruning to those
+    cache-key subdirectories (used to touch only the current op's entries).
+    ``tmp.*`` dirs are skipped so an in-flight compile is never disturbed.
+    Returns the number of files removed.
+    """
+    if not cache_dir.is_dir():
+        return 0
+    keep = (".ttir", ".ttadapter", ".json", ".source")
+    removed = 0
+    for name in os.listdir(cache_dir):
+        if only_dirs is not None and name not in only_dirs:
+            continue
+        key_dir = cache_dir / name
+        if not key_dir.is_dir():
+            continue
+        for root, dirs, files in os.walk(key_dir):
+            dirs[:] = [d for d in dirs if not d.startswith("tmp.")]
+            for fn in files:
+                # Keep real stage dumps only; drop cache group metadata too.
+                if not fn.startswith("__grp__") and fn.endswith(keep):
+                    continue
+                try:
+                    (Path(root) / fn).unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
 
 
 def lookup_case(retry_data: dict, key: str):
@@ -294,6 +372,12 @@ def process_accuracy(op, marker, config, npu, work: dict, log_retry) -> dict:
     if not data:
         return {}
 
+    # Per-case retries are OPT-IN (--retry-cases). By default failures are
+    # recorded as-is: retrying pre-existing failures burned hours for almost no
+    # recovery and added load that perturbed concurrent benchmarks.
+    if not work["retry_cases"]:
+        return data
+
     # Per-case retries on the same NPU/config, bounded by the remaining budget so
     # a case runs at most max_runs times in total.
     remaining_budget = max(0, work["max_runs"] - whole_attempts)
@@ -368,21 +452,24 @@ def process_benchmark(op, marker, config, npu, work: dict, log_retry) -> dict:
     data = None
     for attempt in range(1, work["max_runs"] + 1):
         rc, data = run_benchmark_once(op, marker, config, npu, work, attempt)
-        if bench_success(data):
+        # Only a missing/invalid result JSON is an infrastructure failure worth
+        # retrying. Case-level error_msg or an op-level "failed" is recorded
+        # as-is: retrying the whole op used to push OFF and ON hours apart and
+        # kept only the last (often heavily loaded) measurement.
+        if data is not None:
             if attempt > 1:
                 log_retry({
                     "op": op, "config": config, "stage": "benchmark",
                     "unit": "op", "attempt": attempt, "returncode": rc,
                     "reason": "recovered", "eventually": "passed",
                 })
-            return data or {}
+            return data
         log_retry({
             "op": op, "config": config, "stage": "benchmark",
             "unit": "op", "attempt": attempt, "returncode": rc,
-            "reason": "no_result_json" if not data else "failed_result",
-            "eventually": "failed",
+            "reason": "no_result_json", "eventually": "failed",
         })
-    return data or {}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +488,8 @@ def process_op(op: str, marker: str, order: list[str], npu: int,
     for config in order:
         work = {
             "results_dir": out_root / config / "results",
-            "cache_dir": out_root / config / "cache",
+            # Per-NPU cache so a worker only ever prunes its own entries.
+            "cache_dir": out_root / config / "cache" / f"npu{npu}",
             "timeout": worker_cfg["timeout"],
             "max_runs": worker_cfg["max_runs"],
             "retry_skipped": worker_cfg["retry_skipped"],
@@ -411,13 +499,22 @@ def process_op(op: str, marker: str, order: list[str], npu: int,
             "metrics": worker_cfg["metrics"],
             "device_vars": worker_cfg["device_vars"],
             "generic_ir": worker_cfg["generic_ir"],
+            "retry_cases": worker_cfg["retry_cases"],
         }
-        acc = process_accuracy(op, marker, config, npu, work, log_retry)
-        with (work["results_dir"] / op / "accuracy_result.json").open("w") as fh:
-            json.dump(acc, fh, indent=2, default=str)
-        perf = process_benchmark(op, marker, config, npu, work, log_retry)
-        with (work["results_dir"] / op / "performance_result.json").open("w") as fh:
-            json.dump(perf, fh, indent=2, default=str)
+        cache_dir = work["cache_dir"]
+        before = set(os.listdir(cache_dir)) if cache_dir.is_dir() else set()
+        stage = worker_cfg["stage"]
+        if stage in ("both", "accuracy"):
+            acc = process_accuracy(op, marker, config, npu, work, log_retry)
+            with (work["results_dir"] / op / "accuracy_result.json").open("w") as fh:
+                json.dump(acc, fh, indent=2, default=str)
+        if stage in ("both", "benchmark"):
+            perf = process_benchmark(op, marker, config, npu, work, log_retry)
+            with (work["results_dir"] / op / "performance_result.json").open("w") as fh:
+                json.dump(perf, fh, indent=2, default=str)
+        if worker_cfg["prune_stages"]:
+            new = set(os.listdir(cache_dir)) - before if cache_dir.is_dir() else set()
+            prune_cache_stages(cache_dir, new)
 
     # Per-worker retry log (one file per NPU -> no cross-process contention).
     log_path = out_root / f"retries.{npu}.jsonl"
@@ -469,6 +566,12 @@ def parse_args(argv=None):
     p.add_argument("--ref", default="cpu", choices=["cpu", "device"],
                    help="accuracy reference device (default cpu)")
     p.add_argument("--quick", action="store_true", help="accuracy --quick")
+    p.add_argument("--stage", choices=["both", "accuracy", "benchmark"], default="both",
+                   help="run only this stage; the other stage's existing results "
+                        "are kept (default both)")
+    p.add_argument("--retry-cases", dest="retry_cases", action="store_true",
+                   help="retry failing accuracy cases individually (off by default; "
+                        "whole-op infrastructure retries are always on)")
     p.add_argument("--max-runs", type=int, default=5,
                    help="max total runs/attempts per failing case or op, including "
                         "the first (default 5)")
@@ -486,6 +589,17 @@ def parse_args(argv=None):
                    help="per pytest invocation timeout (s)")
     p.add_argument("--no-compare", action="store_true",
                    help="do not run compare_results.py at the end")
+    p.add_argument("--force", action="store_true",
+                   help="rerun all selected ops even if already finished")
+    p.add_argument("--min-free-gb", type=float, default=0.0,
+                   help="abort before starting if free disk at the output root is "
+                        "below this many GiB (0 = no check)")
+    p.add_argument("--prune-stages", dest="prune_stages", action="store_true",
+                   default=True,
+                   help="keep only .ttir/.ttadapter/.json/.source in the per-run "
+                        "cache as each op finishes (default on)")
+    p.add_argument("--keep-all-stages", dest="prune_stages", action="store_false",
+                   help="keep every dumped stage (.mlirbc/.bcmlir/.npubin/...)")
     p.add_argument("--dry-run", action="store_true", help="print the plan and exit")
     return p.parse_args(argv)
 
@@ -528,6 +642,36 @@ def main(argv=None) -> int:
     )
     ensure_dir(out_root)
 
+    try:
+        free_gb = shutil.disk_usage(out_root).free / (1024 ** 3)
+        print(f"[ab] free disk at output: {free_gb:.1f} GiB")
+    except OSError:
+        free_gb = None
+    if args.min_free_gb > 0 and free_gb is not None and free_gb < args.min_free_gb:
+        print(f"[ab] only {free_gb:.1f} GiB free at {out_root} "
+              f"(< --min-free-gb {args.min_free_gb}) -- aborting")
+        return 1
+
+    configs = list(CONFIGS.keys())
+    stages = ("accuracy", "benchmark") if args.stage == "both" else (args.stage,)
+    all_plan = []
+    for i, op in enumerate(ops):
+        order = ["off", "on"] if i % 2 == 0 else ["on", "off"]
+        all_plan.append((op, markers[op], order))
+
+    # Resume is the default: skip ops that already have complete results for the
+    # requested stages.
+    skipped: list = []
+    if args.force:
+        plan = all_plan
+    else:
+        plan = []
+        for item in all_plan:
+            if op_finished(out_root, configs, item[0], stages):
+                skipped.append(item[0])
+            else:
+                plan.append(item)
+
     pkg_env = this_pkg_env()
     flagtree_version = rt.ENV_INFO.get("flagtree")
     manifest = {
@@ -537,29 +681,44 @@ def main(argv=None) -> int:
         "package_version": pkg_env.get("version"),
         "vendor": pkg_env.get("vendor"),
         "num_ops": len(ops),
+        "n_queued": len(plan),
+        "n_skipped_finished": len(skipped),
         "npus": npus,
         "configs": {k: dict(v) for k, v in CONFIGS.items()},
         "benchmark": {"level": args.level, "metrics": args.metrics},
         "accuracy": {"ref": args.ref, "quick": args.quick},
         "max_runs": args.max_runs,
         "retry_skipped": args.retry_skipped,
+        "retry_cases": args.retry_cases,
+        "stage": args.stage,
         "generic_ir": args.generic_ir,
     }
-    with (out_root / "manifest.json").open("w") as fh:
+    manifest_path = out_root / "manifest.json"
+    previous = read_json(manifest_path)
+    if isinstance(previous, dict):
+        manifest["created"] = previous.get("created", manifest["created"])
+        runs = list(previous.get("runs", []))
+        runs.append({
+            "at": now(),
+            "queued": len(plan),
+            "skipped": len(skipped),
+        })
+        manifest["runs"] = runs
+    with manifest_path.open("w") as fh:
         json.dump(manifest, fh, indent=2, default=str)
-
-    plan = []
-    for i, op in enumerate(ops):
-        order = ["off", "on"] if i % 2 == 0 else ["on", "off"]
-        plan.append((op, markers[op], order))
 
     print(f"[ab] flagtree: {flagtree_version}")
     print(f"[ab] flaggems: {manifest['package_version']}  vendor={manifest['vendor']}")
-    print(f"[ab] ops={len(ops)}  npus={npus}  output={out_root}")
+    print(f"[ab] ops={len(ops)}  queued={len(plan)}  skipped(finished)={len(skipped)}  "
+          f"npus={npus}  output={out_root}")
+    if skipped:
+        shown = ", ".join(skipped[:12]) + (" ..." if len(skipped) > 12 else "")
+        print(f"[ab] skipped finished ops: {shown}")
     print(f"[ab] OFF={CONFIGS['off']}  ON={CONFIGS['on']}")
     print(f"[ab] benchmark level={args.level} metrics={args.metrics}  "
           f"accuracy ref={args.ref}  max_runs={args.max_runs}  "
-          f"generic_ir={args.generic_ir}")
+          f"stage={args.stage} retry_cases={args.retry_cases} "
+          f"generic_ir={args.generic_ir}  prune_stages={args.prune_stages}")
 
     if args.dry_run:
         for op, marker, order in plan[:20]:
@@ -567,6 +726,10 @@ def main(argv=None) -> int:
         if len(plan) > 20:
             print(f"  ... and {len(plan) - 20} more")
         return 0
+
+    if not plan:
+        print("[ab] nothing to do: all selected ops are already finished "
+              "(use --force to rerun them)")
 
     worker_cfg = {
         "timeout": args.timeout,
@@ -579,6 +742,9 @@ def main(argv=None) -> int:
         "skip_cpu": skip_cpu,
         "device_vars": device_vars(),
         "generic_ir": args.generic_ir,
+        "retry_cases": args.retry_cases,
+        "stage": args.stage,
+        "prune_stages": args.prune_stages,
     }
 
     work_q = mp.Queue()
@@ -631,7 +797,10 @@ def main(argv=None) -> int:
             line = line.strip()
             if not line:
                 continue
-            rec = json.loads(line)
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # truncated line from an interrupted run
             total_records += 1
             if rec.get("unit") == "case":
                 key = f"{rec.get('op')}/{rec.get('config')}/{rec.get('case')}"
