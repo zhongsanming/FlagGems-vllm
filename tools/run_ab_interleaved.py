@@ -600,6 +600,10 @@ def parse_args(argv=None):
                         "cache as each op finishes (default on)")
     p.add_argument("--keep-all-stages", dest="prune_stages", action="store_false",
                    help="keep every dumped stage (.mlirbc/.bcmlir/.npubin/...)")
+    p.add_argument("--seed", type=int, default=0,
+                   help="fixed RNG seed exported to the test/benchmark "
+                        "subprocesses as FLAG_GEMS_SEED (plus PYTHONHASHSEED=0); "
+                        "pass a negative value to leave RNGs untouched")
     p.add_argument("--dry-run", action="store_true", help="print the plan and exit")
     return p.parse_args(argv)
 
@@ -618,6 +622,12 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     if args.max_retries is not None:  # deprecated alias
         args.max_runs = args.max_retries + 1
+    # Make runs reproducible: the test/benchmark harnesses read FLAG_GEMS_SEED
+    # (see the _fixed_random_seed fixture in benchmark/conftest.py and
+    # tests/conftest.py) and build_env() copies os.environ into every subprocess.
+    if args.seed >= 0:
+        os.environ["FLAG_GEMS_SEED"] = str(args.seed)
+        os.environ["PYTHONHASHSEED"] = "0"
 
     # Reuse run_tests operators + marker logic and the environment probe.
     rt.OPTS = argparse.Namespace(

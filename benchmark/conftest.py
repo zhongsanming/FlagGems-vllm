@@ -92,6 +92,43 @@ class BenchConfig:
         self.parallel = 0
 
 
+def _seed_rngs_from_env() -> None:
+    """Seed all RNGs when FLAG_GEMS_SEED is set.
+
+    tools/run_ab_interleaved.py exports FLAG_GEMS_SEED so tests/benchmarks that
+    do not seed themselves produce identical inputs across configs and re-runs.
+    """
+    raw = os.environ.get("FLAG_GEMS_SEED")
+    if not raw:
+        return
+    seed = int(raw)
+    import random
+
+    import torch
+
+    from flaggems_vllm.runtime import torch_device_fn
+
+    random.seed(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    torch.manual_seed(seed)
+    manual_seed_all = getattr(torch_device_fn, "manual_seed_all", None)
+    if manual_seed_all is not None:
+        try:
+            manual_seed_all(seed)
+        except Exception:
+            pass
+
+
+@pytest.fixture(scope="function", autouse=True)
+def _fixed_random_seed():
+    _seed_rngs_from_env()
+
+
 def pytest_addoption(parser):
     parser.addoption(
         (
