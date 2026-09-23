@@ -12,6 +12,9 @@ NPUs.
           TRITON_LANE_VECTORIZE_ALLOW_CONCAT=1
           TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES=1
 
+Each packing mode is on by default; turn individual ones off with
+--no-block-mode / --no-allow-concat / --no-allow-address-cones.
+
 Every compilation is forced fresh (TRITON_ALWAYS_COMPILE=1) and dumped into a
 per-config, per-NPU cache (TRITON_CACHE_DIR). By default only the TTIR/TTADAPTER
 dumps plus the ``.json`` metadata and ``.source`` are kept; the other stages
@@ -591,6 +594,20 @@ def parse_args(argv=None):
                         "(TRITON_MLIR_PRINT_OP_GENERIC=1; default on)")
     p.add_argument("--no-generic-ir", dest="generic_ir", action="store_false",
                    help="use the default (custom) MLIR printer for dumps")
+    p.add_argument("--block-mode", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="ON config: enable LaneVectorize block mode "
+                        "(TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE=1; default on)")
+    p.add_argument("--allow-concat", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="ON config: allow the guarded tensor.concat pack "
+                        "fallback (TRITON_LANE_VECTORIZE_ALLOW_CONCAT=1; "
+                        "default on)")
+    p.add_argument("--allow-address-cones", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="ON config: allow packing address/index cones "
+                        "(TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES=1; "
+                        "default on)")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                    help="per pytest invocation timeout (s)")
     p.add_argument("--no-compare", action="store_true",
@@ -634,6 +651,17 @@ def main(argv=None) -> int:
     if args.seed >= 0:
         os.environ["FLAG_GEMS_SEED"] = str(args.seed)
         os.environ["PYTHONHASHSEED"] = "0"
+    # Apply the LaneVectorize packing toggles to the ON config (OFF always
+    # disables the pass entirely). Defaults keep block mode and both guarded
+    # pack paths on.
+    CONFIGS["on"].update({
+        "TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE":
+            "1" if args.block_mode else "0",
+        "TRITON_LANE_VECTORIZE_ALLOW_CONCAT":
+            "1" if args.allow_concat else "0",
+        "TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES":
+            "1" if args.allow_address_cones else "0",
+    })
 
     # Reuse run_tests operators + marker logic and the environment probe.
     rt.OPTS = argparse.Namespace(
