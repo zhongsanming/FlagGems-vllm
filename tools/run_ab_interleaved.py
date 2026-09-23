@@ -608,6 +608,12 @@ def parse_args(argv=None):
                    help="ON config: allow packing address/index cones "
                         "(TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES=1; "
                         "default on)")
+    p.add_argument("--precompile", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="precompile the Ascend launcher header as "
+                        "precompiled.h.gch (TRITON_DISABLE_PRECOMPILE=0) to "
+                        "speed up host launcher builds; --no-precompile skips "
+                        "the large regenerable .gch and saves disk (default on)")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                    help="per pytest invocation timeout (s)")
     p.add_argument("--no-compare", action="store_true",
@@ -651,6 +657,10 @@ def main(argv=None) -> int:
     if args.seed >= 0:
         os.environ["FLAG_GEMS_SEED"] = str(args.seed)
         os.environ["PYTHONHASHSEED"] = "0"
+    # Precompiled launcher header: TRITON_DISABLE_PRECOMPILE is not a kernel
+    # cache key, so this only decides whether the (large, regenerable)
+    # precompiled.h.gch is built. build_env() inherits it into the subprocesses.
+    os.environ["TRITON_DISABLE_PRECOMPILE"] = "0" if args.precompile else "1"
     # Apply the LaneVectorize packing toggles to the ON config (OFF always
     # disables the pass entirely). Defaults keep block mode and both guarded
     # pack paths on.
