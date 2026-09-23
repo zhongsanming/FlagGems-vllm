@@ -9,6 +9,8 @@ NPUs.
     OFF : TRITON_DISABLE_LANE_VECTORIZE=1
     ON  : TRITON_DISABLE_LANE_VECTORIZE=0
           TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE=1
+          TRITON_LANE_VECTORIZE_ALLOW_CONCAT=1
+          TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES=1
 
 Every compilation is forced fresh (TRITON_ALWAYS_COMPILE=1) and dumped into a
 per-config, per-NPU cache (TRITON_CACHE_DIR). By default only the TTIR/TTADAPTER
@@ -114,8 +116,10 @@ VENDOR_DEVICE_VARS = {
     "enflame": ["TOPS_VISIBLE_DEVICES"],
 }
 
-# The two configurations. ``off`` is the full pass off; ``on`` keeps the pass
-# on with block mode explicitly enabled.
+# The two configurations. ``off`` is the full pass off; ``on`` keeps the pass on
+# with block mode enabled and opts into both guarded pack paths (the
+# tensor.concat fallback and packing of address/index cones), so ON exercises
+# every packing strategy.
 CONFIGS = {
     "off": {
         "TRITON_DISABLE_LANE_VECTORIZE": "1",
@@ -123,11 +127,13 @@ CONFIGS = {
     "on": {
         "TRITON_DISABLE_LANE_VECTORIZE": "0",
         "TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE": "1",
+        "TRITON_LANE_VECTORIZE_ALLOW_CONCAT": "1",
+        "TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES": "1",
     },
 }
 
-# Optional pass guards (defaults are the safe/guarded values on the flagtree
-# side). Kept out of CONFIGS so the A/B only differs by the block-mode toggle.
+# Pass-related env vars cleared from the inherited environment before a config
+# is applied, so a stale value in the caller's shell never leaks into a run.
 PASS_ENV_NAMES = [
     "TRITON_DISABLE_LANE_VECTORIZE",
     "TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE",
