@@ -116,12 +116,30 @@ def _seed_rngs_from_env() -> None:
     except ImportError:
         pass
     torch.manual_seed(seed)
+
+    seeded_device = False
     manual_seed_all = getattr(torch_device_fn, "manual_seed_all", None)
-    if manual_seed_all is not None:
+    if callable(manual_seed_all):
+        manual_seed_all(seed)
+        seeded_device = True
+
+    default_generators = getattr(torch_device_fn, "default_generators", None)
+    if default_generators is not None:
         try:
-            manual_seed_all(seed)
-        except Exception:
-            pass
+            for gen in default_generators:
+                gen.manual_seed(seed)
+            seeded_device = True
+        except TypeError:
+            gen = default_generators[torch_device_fn.current_device()]
+            gen.manual_seed(seed)
+            seeded_device = True
+
+    if not seeded_device:
+        raise RuntimeError(
+            "FLAG_GEMS_SEED was set but no accelerator RNG could be seeded: "
+            "torch_device_fn has neither a callable manual_seed_all nor "
+            "default_generators. A/B runs would compare different inputs."
+        )
 
 
 @pytest.fixture(scope="function", autouse=True)
