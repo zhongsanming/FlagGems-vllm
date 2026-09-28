@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import has_triton_tle, libentry, libtuner
 
 if has_triton_tle(3, 6, 0):
@@ -126,9 +127,10 @@ def _pick_tle_atomic_fused_launch_params(
 def _pick_tle_atomic_fused_num_blocks(
     numel: int, num_experts: int, block_tokens: int, device: torch.device
 ) -> int:
-    if device.type != "cuda" or not torch.cuda.is_available():
+    try:
+        props = torch_device_fn.get_device_properties(device)
+    except Exception:
         return 1
-    props = torch.cuda.get_device_properties(device)
     sm_count = int(getattr(props, "multi_processor_count", 1))
     token_programs = triton.cdiv(numel, block_tokens)
     cap_mult = 4 if num_experts < 256 else 16
