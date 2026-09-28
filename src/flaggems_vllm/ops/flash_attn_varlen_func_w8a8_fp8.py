@@ -3044,7 +3044,7 @@ def mha_fwd(
         # Do kernel dispatching
         def dispatch(B, H, Q, K, D, params):
             num_sms = torch_device_fn.get_device_properties(
-                "cuda"
+                runtime.device.name
             ).multi_processor_count
             # For D128, use the split-D dense kernel and partition the output
             # dimension across two D64 CTAs to reduce register pressure in
