@@ -256,6 +256,15 @@ def build_env(npu: int, config: str, cache_dir: Path,
     # Force a fresh compilation and keep every dumped stage in this run's cache.
     env["TRITON_ALWAYS_COMPILE"] = "1"
     env["TRITON_CACHE_DIR"] = str(cache_dir)
+    # Isolate FlagGems' own persistent caches (notably the runtime autotune
+    # config DB at <dir>/config_cache/TunedConfig_*.db). A single shared DB is
+    # read/written by every NPU worker, both compiler configs and every run, so
+    # the autotuner's winning config (and hence, for reductions, the fp
+    # accumulation order) can differ between the whole-op run and its retries,
+    # producing spurious flaky accuracy results. Give each (config, npu) its
+    # own cache root, mirroring TRITON_CACHE_DIR above.
+    env["FLAGGEMS_CACHE_DIR"] = str(cache_dir.parent.parent / "flag_gems_cache"
+                                    / cache_dir.name)
     # Print dumped stage IR (including .ttir) in MLIR generic op form, i.e.
     # --mlir-print-op-generic, for canonical/diffable dumps.
     env["TRITON_MLIR_PRINT_OP_GENERIC"] = "1" if generic_ir else "0"
